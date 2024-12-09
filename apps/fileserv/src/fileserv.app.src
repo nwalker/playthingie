@@ -1,0 +1,14 @@
+{application, fileserv, [
+    {description, "totally dumb http file server"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {mod, {fileserv, []}},
+    {applications, [
+        kernel,
+        stdlib,
+        cowboy
+    ]},
+    {env, []},
+    {modules, []},
+    {links, []}
+ ]}.

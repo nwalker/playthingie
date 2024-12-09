@@ -9,3 +9,96 @@
 * файл может быть большим (больше количества оперативной памяти)
 * В случае, если сервер не успевает обработать запрос в течении заданного таймаута (например диск занят из-за большого кол-ва запросов), возвращается ошибка 503 Overloaded
 * make test должен выполнить тесты
+
+# Описание решения
+Оформлено как почти классическое OTP-приложение(без отдельных модулей на application и supervisor, чтобы ревьюеру меньше читать).
+
+Обработка запроса разбита на три модуля - HTTP-обработчик поверх cowboy(fileserv_http), абстракция файловой системы(fileserv_fs и реализация для тестов fileserv_fs_dummy), специфичный таск-менеджер(fileserv_task). 
+
+Дополнительные слушатели можно запускать на лету из консоли через `fileserv:add_listener/2`. Первый параметр - порт, второй - конфиг для http-обработчика, см. ниже в разделе fileserv_http.
+
+```
+4> fileserv:add_listener(12092, #{}).
+{ok,<0.303.0>}
+5> fileserv:add_listener(12092, #{}).
+{error,{already_started,<0.303.0>}}
+``` 
+
+```
+nwalker@OMENlap:~/pg/fileserv$ curl -sv -XHEAD localhost:12092/rebar.config
+*   Trying 127.0.0.1:12092...
+* Connected to localhost (127.0.0.1) port 12092 (#0)
+> HEAD /rebar.config HTTP/1.1
+> Host: localhost:12092
+> User-Agent: curl/7.81.0
+> Accept: */*
+>
+* Mark bundle as not supporting multiuse
+< HTTP/1.1 204 No Content
+< content-length: 878
+< date: Mon, 09 Dec 2024 00:02:34 GMT
+< etag: 6646C695626AE899091A2F2E3FE81B00
+< server: Cowboy
+<
+* Connection #0 to host localhost left intact
+nwalker@OMENlap:~/pg/fileserv$ md5sum rebar.config
+6646c695626ae899091a2f2e3fe81b00  rebar.config
+```
+
+
+## fileserv_http
+Ничего необычного, берет модуль фс и таймаут из параметров, считает etag, немного транслирует ошибки.
+Конфиг обработчика:
+```
+#{
+    timeout => positive_integer, % таймаут 
+    device => atom, % используемая реализация ФС
+    device_opts => #{} % конфиг для реализации ФС
+}
+```
+
+## fileserv_fs 
+Доступ к реальной ФС. Пытается быть минимально безопасным - путь к файлу не может выйти выше заданного корня. 
+Корень задается параметром root в device_opts, см. `fileserv_SUITE:init_per_group(basic)`, без явного корня используется CWD.
+
+## fileserv_fs_dummy
+Мне показалось хорошей идеей сделать реализацию фейковой ФС, которая бы генерировала предсказуемые файлы на основе пути из запроса 
+(пока я отлаживал fileserv_fs_dummy:pread c его границами и всякими off-by-one я неоднократно эту идею проклял).
+
+Принимает запрос из двух сегментов - сид и размер, "/asd/1K", "/raw:asd/10G500M110". 
+Размер виртуального файла описывается вторым сегментом пути. 
+
+Содержимое файла - повторяющийся блок, обрезанный в конце по границе размера.  
+
+Блок - это либо sha256 сида, либо его часть после префикса "raw:".
+
+Для примера, итоговое содержимое файла "/raw:dummy/10" - "dummydummy".  
+
+```
+nwalker@OMENlap:~/pg/fileserv$ curl -sv -XHEAD localhost:12091/raw:dummy/10
+*   Trying 127.0.0.1:12091...
+* Connected to localhost (127.0.0.1) port 12091 (#0)
+> HEAD /raw:dummy/10 HTTP/1.1
+> Host: localhost:12091
+> User-Agent: curl/7.81.0
+> Accept: */*
+>
+* Mark bundle as not supporting multiuse
+< HTTP/1.1 204 No Content
+< content-length: 10
+< date: Sun, 08 Dec 2024 23:59:22 GMT
+< etag: 2284E85C761030AF4607677D8BC8404D
+< server: Cowboy
+<
+* Connection #0 to host localhost left intact
+nwalker@OMENlap:~/pg/fileserv$ echo -n  "dummydummy" | md5sum -
+2284e85c761030af4607677d8bc8404d  -
+```
+
+## fileserv_task
+Нужен для того, чтобы остановить процесс вычисления etag в случае, когда http-обработчик уже не дождался результата. 
+
+Казалось бы, почему не запустить посчет хэша обычным spawn_link прямо из обработчика, но есть нюанс. 
+Если отдавать вменяемый HTTP-ответ в ситуации таймаута, процесс обработчика завершится с reason=normal, который не приводит к убийству слинкованных процессов. 
+
+Было две альтернативы - написать специфичный цикл вычисления хэша "прочитать блок, добавить его к хэшу, проверить мейлбокс" или добавить еще один процесс, я выбрал еще один процесс.  
